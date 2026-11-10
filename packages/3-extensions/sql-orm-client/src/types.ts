@@ -24,6 +24,7 @@ import {
   type OrderByNulls,
   ParamRef,
   type AggregateFn as SqlAggregateFn,
+  type SqlTransactionStart,
   type WhereArg,
 } from '@internal/sql-relational-core/ast';
 import type {
@@ -39,6 +40,10 @@ import type {
 import type { ExecutionContext } from '@internal/sql-relational-core/query-lane-context';
 import type { ComputeColumnJsType, RuntimeScope } from '@internal/sql-relational-core/types';
 import type { ActivitySourceTarget } from '@internal/sql-runtime';
+import type {
+  SettledTransactionTarget,
+  TransactionStartTarget,
+} from '@internal/sql-runtime/internal/prepared-query';
 import type { CollectionTables } from './collection-tables';
 import type { HasRow } from './collection-types';
 import { checkedOrderByItem } from './order-by-guards';
@@ -181,12 +186,13 @@ export type WithNsId<State extends CollectionTypeState, NsId extends string> = O
   'nsId'
 > & { readonly nsId: NsId };
 
-export interface RuntimeConnection extends RuntimeScope {
+export interface RuntimeConnection extends RuntimeScope, Partial<TransactionStartTarget> {
   release?(): Promise<void>;
-  transaction?(): Promise<RuntimeTransaction>;
+  destroy?(reason?: unknown): Promise<void>;
+  transaction?(start?: SqlTransactionStart): Promise<RuntimeTransaction>;
 }
 
-export interface RuntimeTransaction extends RuntimeScope {
+export interface RuntimeTransaction extends RuntimeScope, Partial<SettledTransactionTarget> {
   commit?(): Promise<void>;
   rollback?(): Promise<void>;
 }
@@ -194,7 +200,7 @@ export interface RuntimeTransaction extends RuntimeScope {
 /** What the ORM sends its statements to. It must carry an `activitySource` member, as the SQL runtime's queryables, connections, transactions and activity handles do: every terminal method starts an `orm-call` activity through it, and a terminal method on a queryable without one fails with `ORM.ACTIVITY_SOURCE_MISSING`. The member is optional in this type only because the public runtime types do not show it. */
 export interface RuntimeQueryable extends RuntimeScope, Partial<ActivitySourceTarget> {
   connection?(): Promise<RuntimeConnection>;
-  transaction?(): Promise<RuntimeTransaction>;
+  transaction?(start?: SqlTransactionStart): Promise<RuntimeTransaction>;
 }
 
 export interface CollectionContext<TContract extends Contract<SqlStorage>> {

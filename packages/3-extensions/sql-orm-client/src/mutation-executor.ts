@@ -4,7 +4,7 @@ import { isUniqueConstraintViolation } from '@internal/sql-errors';
 import { type AnyExpression, BinaryExpr } from '@internal/sql-relational-core/ast';
 import type { ExecutionContext } from '@internal/sql-relational-core/query-lane-context';
 import type { RuntimeScope } from '@internal/sql-relational-core/types';
-import { settlementOf } from '@internal/sql-runtime/internal/prepared-query';
+import { settlementOf, wasRefusedBeforeBegin } from '@internal/sql-runtime/internal/prepared-query';
 import { castAs } from '@internal/utils/casts';
 import { InternalError } from '@internal/utils/internal-error';
 import {
@@ -257,7 +257,7 @@ export async function withMutationScope<T>(
 ): Promise<T> {
   // A top-level transaction wins when the runtime exposes one directly.
   if (typeof runtime.transaction === 'function') {
-    return runInTransaction(await runtime.transaction(), run);
+    return runInTransaction(await runtime.transaction({ kind: 'implicit' }), run);
   }
 
   // Otherwise open a connection and run the whole mutation graph inside its
@@ -266,13 +266,36 @@ export async function withMutationScope<T>(
   // graph that fails after the first write would leave a partial write behind.
   if (typeof runtime.connection === 'function') {
     const connection = await runtime.connection();
+    let clean = false;
+    let transaction: RuntimeTransaction | undefined;
+    let failure: { error: unknown } | undefined;
+    const dispose = async (): Promise<void> => {
+      try {
+        if (clean) await connection.release?.();
+        else await connection.destroy?.(failure?.error);
+      } catch (error) {
+        if (failure === undefined) throw error;
+      }
+    };
     try {
       if (typeof connection.transaction === 'function') {
-        return await runInTransaction(await connection.transaction(), run);
+        transaction = await connection.transaction({ kind: 'implicit' });
+        return await runInTransaction(transaction, run, () => {
+          clean = true;
+        });
       }
+      clean = true;
       return await run(connection);
+    } catch (error) {
+      failure = { error };
+      if (transaction === undefined && wasRefusedBeforeBegin(connection)) clean = true;
+      throw error;
     } finally {
-      await connection.release?.();
+      if (transaction !== undefined) {
+        const settlement = settlementOf(transaction);
+        clean ||= settlement?.committed === true || settlement?.rolledBack === true;
+      }
+      await dispose();
     }
   }
 
@@ -283,17 +306,20 @@ export async function withMutationScope<T>(
 async function runInTransaction<T>(
   transaction: RuntimeTransaction,
   run: (scope: RuntimeScope) => Promise<T>,
+  onSettled: () => void = () => {},
 ): Promise<T> {
   try {
     const result = await run(transaction);
     if (typeof transaction.commit === 'function') {
       await transaction.commit();
+      onSettled();
     }
     return result;
   } catch (error) {
     if (typeof transaction.rollback === 'function') {
       try {
         await transaction.rollback();
+        onSettled();
       } catch (rollbackError) {
         // A hook that threw after the ROLLBACK landed must not replace the error that caused it.
         const settlement = settlementOf(transaction);
